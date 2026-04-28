@@ -42,8 +42,8 @@ class SimCollectorActivity : ComponentActivity() {
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
             val grantedRead = results[Manifest.permission.READ_PHONE_STATE] ?: false
-            val grantedSend = results[Manifest.permission.SEND_SMS] ?: false
-            if (grantedRead || grantedSend) {
+            val grantedCall = results[Manifest.permission.CALL_PHONE] ?: false
+            if (grantedRead || grantedCall) {
                 vm.refresh()
             }
         }
@@ -57,11 +57,11 @@ class SimCollectorActivity : ComponentActivity() {
             ViewModelProvider.AndroidViewModelFactory.getInstance(application as Application)
         ).get(MainViewModel::class.java)
 
-        // Request READ_PHONE_STATE and SEND_SMS permissions to detect SIMs and send verification SMS
+        // Request READ_PHONE_STATE and CALL_PHONE permissions to detect SIMs and run USSD
         val needRead = ContextCompat.checkSelfPermission(this, Manifest.permission.READ_PHONE_STATE) != PackageManager.PERMISSION_GRANTED
-        val needSend = ContextCompat.checkSelfPermission(this, Manifest.permission.SEND_SMS) != PackageManager.PERMISSION_GRANTED
-        if (needRead || needSend) {
-            permissionLauncher.launch(arrayOf(Manifest.permission.READ_PHONE_STATE, Manifest.permission.SEND_SMS))
+        val needCall = ContextCompat.checkSelfPermission(this, Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED
+        if (needRead || needCall) {
+            permissionLauncher.launch(arrayOf(Manifest.permission.READ_PHONE_STATE, Manifest.permission.CALL_PHONE))
         } else {
             vm.refresh()
         }
@@ -163,35 +163,36 @@ class SimCollectorActivity : ComponentActivity() {
 
                 // Action Button
                 item {
-                    val vs = vm.verificationState
+                    val verification = vm.ussdVerificationState
                     Button(
-                        onClick = { vm.applySimTask("EXECUTE") },
+                        onClick = { vm.verifySelectedSimNumber() },
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(top = 16.dp),
-                        enabled = vm.selectedSimIndex >= 0 && !vs.isLoading
+                        enabled = vm.selectedSimIndex >= 0 && !verification.isLoading
                     ) {
-                        if (vs.isLoading) {
+                        if (verification.isLoading) {
                             CircularProgressIndicator(
                                 modifier = Modifier.padding(end = 8.dp),
                                 strokeWidth = 2.dp,
                                 color = MaterialTheme.colorScheme.onPrimary
                             )
                         }
-                        Text(text = if (vs.isLoading) "Verifying..." else "Verify Mobile Number")
+                        Text(text = if (verification.isLoading) "Checking..." else "Verify Mobile Number")
                     }
                 }
 
-                // Verification status card
+                // USSD status card
                 item {
-                    val vs = vm.verificationState
-                    if (vs.status.isNotEmpty()) {
-                        val (bgColor, label) = when (vs.status) {
-                            "verified" -> Color(0xFFE8F5E9) to "Verified"
-                            "pending"  -> Color(0xFFFFFDE7) to "Pending..."
-                            "timeout"  -> Color(0xFFFFF3E0) to "Timed Out"
-                            "error"    -> Color(0xFFFFEBEE) to "Error"
-                            else       -> Color(0xFFF5F5F5) to vs.status
+                    val verification = vm.ussdVerificationState
+                    if (verification.statusMessage.isNotEmpty()) {
+                        val bgColor = if (verification.statusMessage.contains("failed", ignoreCase = true)
+                            || verification.statusMessage.contains("error", ignoreCase = true)
+                            || verification.statusMessage.contains("permission", ignoreCase = true)
+                        ) {
+                            Color(0xFFFFEBEE)
+                        } else {
+                            Color(0xFFE8F5E9)
                         }
                         Card(
                             modifier = Modifier.fillMaxWidth(),
@@ -199,33 +200,16 @@ class SimCollectorActivity : ComponentActivity() {
                         ) {
                             Column(modifier = Modifier.padding(16.dp)) {
                                 Text(
-                                    text = "Verification Status: $label",
+                                    text = "USSD Verification Result",
                                     style = MaterialTheme.typography.titleSmall,
                                     fontWeight = FontWeight.Bold
                                 )
-                                if (vs.status == "verified" && vs.phoneNumber.isNotEmpty()) {
-                                    Text(
-                                        text = "Phone: ${vs.phoneNumber}",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        modifier = Modifier.padding(top = 4.dp)
-                                    )
-                                }
-                                if (vs.hashCode.isNotEmpty()) {
-                                    Text(
-                                        text = "Hash: ${vs.hashCode}",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        modifier = Modifier.padding(top = 4.dp)
-                                    )
-                                }
-                                if (vs.errorMessage.isNotEmpty()) {
-                                    Text(
-                                        text = vs.errorMessage,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = Color(0xFFD32F2F),
-                                        modifier = Modifier.padding(top = 4.dp)
-                                    )
-                                }
+                                Text(
+                                    text = verification.statusMessage,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(top = 4.dp)
+                                )
                             }
                         }
                     }

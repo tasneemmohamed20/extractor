@@ -180,6 +180,7 @@ fun DeviceInfoScreen(
                 InfoRow("CPU CORES", "${hardwareInfo.cpuCores}", changeable = false)
                 InfoRow("KERNEL ARCH", hardwareInfo.kernelArch, changeable = false)
                 InfoRow("ANDROID ID", hardwareInfo.androidId, changeable = false)
+                InfoRow("MEDIA DRM ID", hardwareInfo.mediaDrmId, changeable = false)
                 InfoRow("IMEI", hardwareInfo.imei, changeable = false)
                 InfoRow("BLUETOOTH ADDRESS", hardwareInfo.bluetoothAddress, changeable = false)
             }

@@ -3,9 +3,14 @@ package com.example.extractor.ui.viewmodel
 import android.app.Application
 import android.Manifest
 import android.content.pm.PackageManager
-import android.telephony.SmsManager
-import android.util.Log
+import android.content.Context
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.telephony.SubscriptionManager
+import android.telephony.TelephonyManager
 import androidx.core.content.ContextCompat
+import androidx.core.app.ActivityCompat
 import androidx.lifecycle.AndroidViewModel
 import com.example.extractor.data.BuildInfo
 import com.example.extractor.data.VersionInfo
@@ -16,22 +21,32 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-import java.net.HttpURLConnection
-import java.net.URL
-import java.io.InputStreamReader
-import org.json.JSONObject
 
-data class VerificationState(
+data class UssdVerificationState(
     val isLoading: Boolean = false,
-    val hashCode: String = "",
-    val status: String = "",  // "pending", "verified", "error", "timeout"
-    val phoneNumber: String = "",
-    val errorMessage: String = ""
+    val statusMessage: String = ""
 )
 
+enum class EgyptianMobileOperator(
+    val operatorName: String,
+    val shortCode: String
+) {
+    VODAFONE("Vodafone", "*878#"),
+    ORANGE("Orange", "*119#"),
+    ETISALAT("Etisalat", "*947#"),
+    WE("WE", "*688#");
+
+    companion object {
+        fun fromOperatorName(value: String): EgyptianMobileOperator? {
+            val normalizedValue = value.trim()
+            if (normalizedValue.isEmpty()) return null
+
+            return entries.firstOrNull {
+                normalizedValue.contains(it.operatorName, ignoreCase = true)
+            }
+        }
+    }
+}
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     var buildInfo by mutableStateOf(BuildInfo())
@@ -47,6 +62,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         cpuCores = 0,
         kernelArch = "N/A",
         androidId = "N/A",
+        mediaDrmId = "N/A",
         imei = "N/A",
         bluetoothAddress = "N/A",
         simOperator = "N/A",
@@ -66,7 +82,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     var selectedSimIndex by mutableStateOf(-1)
         private set
 
-    var verificationState by mutableStateOf(VerificationState())
+    var ussdVerificationState by mutableStateOf(UssdVerificationState())
         private set
 
     init {
@@ -95,166 +111,115 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /**
-     * Apply a task on the selected SIM (e.g., send SMS, make call, etc.)
-     * This can be expanded based on your actual use case.
-     */
-    fun applySimTask(taskType: String) {
-        if (selectedSimIndex >= 0 && selectedSimIndex < hardwareInfo.simCards.size) {
-            val selectedSim = hardwareInfo.simCards[selectedSimIndex]
-            // Perform action based on taskType
-            when (taskType) {
-                "INFO" -> {
-                    // Log or handle SIM info retrieval
-                }
-                "SMS" -> {
-                    // Send SMS via selected SIM
-                }
-                "CALL" -> {
-                    // Make call via selected SIM
-                }
-                "EXECUTE" -> {
-                    startVerificationOnSelectedSim()
-                }
-                else -> {
-                    // Default action
-                }
-            }
-        }
-    }
-
-    /**
-     * Start verification flow for the selected SIM:
-     * 1. Call server /generate-hash to get a hash
-     * 2. Send SMS from device with message `AuthRequest:<hash>` using the selected SIM subscriptionId
-     * 3. Poll server /check-status/:hash until verified or timeout
-     */
-    fun startVerificationOnSelectedSim() {
+    fun verifySelectedSimNumber() {
         if (selectedSimIndex < 0 || selectedSimIndex >= hardwareInfo.simCards.size) {
-            Log.w(TAG, "startVerification: no valid SIM selected (index=$selectedSimIndex)")
+            ussdVerificationState = UssdVerificationState(
+                isLoading = false,
+                statusMessage = "Select a valid SIM first."
+            )
             return
         }
 
         val sim = hardwareInfo.simCards[selectedSimIndex]
-        Log.d(TAG, "startVerification: SIM slot=${sim.slotIndex} operator=${sim.operatorName} subId=${sim.subscriptionId}")
+        val operator = EgyptianMobileOperator.fromOperatorName(sim.operatorName)
+            ?: EgyptianMobileOperator.fromOperatorName(sim.displayName)
 
-        viewModelScope.launch {
-            verificationState = verificationState.copy(isLoading = true, status = "pending", errorMessage = "")
-
-            val baseUrl = SERVER_BASE_URL
-            Log.d(TAG, "baseUrl=$baseUrl")
-
-            try {
-                // Step 1: fetch hash from server
-                Log.d(TAG, "Step 1: GET $baseUrl/generate-hash")
-                val (generateCode, generateBody) = withContext(Dispatchers.IO) {
-                    val c = (URL("$baseUrl/generate-hash").openConnection() as HttpURLConnection).apply {
-                        requestMethod = "GET"
-                        connectTimeout = 5000
-                        readTimeout = 5000
-                    }
-                    val code = c.responseCode
-                    val body = if (code == 200) InputStreamReader(c.inputStream).use { it.readText() } else ""
-                    Log.d(TAG, "Step 1 response: code=$code body=$body")
-                    code to body
-                }
-
-                if (generateCode != 200) {
-                    Log.e(TAG, "Step 1 failed: HTTP $generateCode")
-                    verificationState = verificationState.copy(isLoading = false, status = "error", errorMessage = "Server returned $generateCode")
-                    return@launch
-                }
-
-                val hash = JSONObject(generateBody).optString("hashCode")
-                Log.d(TAG, "Step 1 success: hash=$hash")
-                verificationState = verificationState.copy(hashCode = hash)
-
-                // Step 2: send real SMS to Twilio number — Twilio will POST to /webhook-sms
-                val context = getApplication<Application>().applicationContext
-                val hasSmsPermission = ContextCompat.checkSelfPermission(
-                    context, Manifest.permission.SEND_SMS
-                ) == PackageManager.PERMISSION_GRANTED
-
-                if (!hasSmsPermission) {
-                    Log.e(TAG, "Step 2 failed: SEND_SMS permission not granted")
-                    verificationState = verificationState.copy(isLoading = false, status = "error", errorMessage = "SEND_SMS permission missing")
-                    return@launch
-                }
-
-                Log.d(TAG, "Step 2: sending SMS to $TWILIO_PHONE_NUMBER via subId=${sim.subscriptionId}  msg=AuthRequest:$hash")
-                try {
-                    withContext(Dispatchers.IO) {
-                        @Suppress("DEPRECATION")
-                        val smsManager = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP_MR1) {
-                            SmsManager.getSmsManagerForSubscriptionId(sim.subscriptionId)
-                        } else {
-                            SmsManager.getDefault()
-                        }
-                        smsManager.sendTextMessage(TWILIO_PHONE_NUMBER, null, "AuthRequest:$hash", null, null)
-                    }
-                    Log.d(TAG, "Step 2 success: SMS dispatched, waiting for Twilio webhook")
-                } catch (e: Exception) {
-                    Log.e(TAG, "Step 2 failed: ${e.javaClass.simpleName}: ${e.message}", e)
-                    verificationState = verificationState.copy(isLoading = false, status = "error", errorMessage = "Failed to send SMS: ${e.message}")
-                    return@launch
-                }
-
-                // Step 3: poll /check-status until verified or timeout
-                val checkUrl = "$baseUrl/check-status/$hash"
-                var verified = false
-                repeat(20) { attempt ->
-                    if (verified) return@repeat
-                    delay(3000)
-                    Log.d(TAG, "Step 3: poll attempt ${attempt + 1}/20  GET $checkUrl")
-                    try {
-                        val (statusCode, statusBody) = withContext(Dispatchers.IO) {
-                            val c = (URL(checkUrl).openConnection() as HttpURLConnection).apply {
-                                requestMethod = "GET"
-                                connectTimeout = 5000
-                                readTimeout = 5000
-                            }
-                            val code = c.responseCode
-                            val body = if (code == 200) InputStreamReader(c.inputStream).use { it.readText() } else ""
-                            Log.d(TAG, "Step 3 poll response: code=$code body=$body")
-                            code to body
-                        }
-                        if (statusCode == 200 && statusBody.isNotEmpty()) {
-                            val j = JSONObject(statusBody)
-                            val status = j.optString("status")
-                            val phone = j.optString("phoneNumber")
-                            Log.d(TAG, "Step 3: status=$status phone=$phone")
-                            if (status == "verified") {
-                                verified = true
-                                verificationState = verificationState.copy(isLoading = false, status = "verified", phoneNumber = phone)
-                            } else {
-                                verificationState = verificationState.copy(status = status)
-                            }
-                        }
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Step 3 poll error (attempt ${attempt + 1}): ${e.javaClass.simpleName}: ${e.message}")
-                    }
-                }
-
-                if (!verified) {
-                    Log.w(TAG, "Step 3: timed out after 20 attempts")
-                    verificationState = verificationState.copy(isLoading = false, status = "timeout", errorMessage = "Verification timed out")
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Verification failed: ${e.javaClass.simpleName}: ${e.message}", e)
-                verificationState = verificationState.copy(isLoading = false, status = "error", errorMessage = e.message ?: e.javaClass.simpleName)
-            }
+        if (operator == null) {
+            ussdVerificationState = UssdVerificationState(
+                isLoading = false,
+                statusMessage = "Unsupported operator for SIM ${sim.slotIndex + 1}: ${sim.operatorName}"
+            )
+            return
         }
-    }
 
-    companion object {
-        private const val TAG = "SimVerification"
+        val context = getApplication<Application>().applicationContext
+        ussdVerificationState = UssdVerificationState(
+            isLoading = true,
+            statusMessage = "Running ${operator.shortCode} on SIM ${sim.slotIndex + 1}..."
+        )
 
-        /** Paste your Cloudflare tunnel URL here — run: cloudflared tunnel --url http://localhost:3000 */
-        private const val SERVER_BASE_URL = "https://your-tunnel.trycloudflare.com"
-
-        /** Your Twilio phone number in E.164 format, e.g. "+12015551234" */
-        private const val TWILIO_PHONE_NUMBER = "+1XXXXXXXXXX"
+        context.callUssdOnSimSlot(operator.shortCode, sim.slotIndex) { result ->
+            ussdVerificationState = UssdVerificationState(
+                isLoading = false,
+                statusMessage = result
+            )
+        }
     }
 }
 
+private fun Context.callUssdOnSimSlot(
+    ussdCode: String,
+    simSlotIndex: Int,
+    onResult: (String) -> Unit
+) {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+        onResult("USSD API requires Android 8.0 or higher.")
+        return
+    }
+
+    val subscriptionManager =
+        getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE) as? SubscriptionManager
+            ?: run {
+                onResult("Subscription manager not available")
+                return
+            }
+    val telephonyManager =
+        getSystemService(Context.TELEPHONY_SERVICE) as? TelephonyManager ?: run {
+            onResult("Telephony manager not available")
+            return
+        }
+
+    if (ActivityCompat.checkSelfPermission(this, Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED) {
+        onResult("Permission not granted. Please allow phone call permission.")
+        return
+    }
+
+    try {
+        val activeSubs = subscriptionManager.activeSubscriptionInfoList
+        if (activeSubs.isNullOrEmpty()) {
+            onResult("No active SIMs detected.")
+            return
+        }
+
+        val simInfo = activeSubs.firstOrNull { it.simSlotIndex == simSlotIndex }
+        if (simInfo == null) {
+            onResult("SIM ${simSlotIndex + 1} is not active.")
+            return
+        }
+
+        val ussdCallback = object : TelephonyManager.UssdResponseCallback() {
+            override fun onReceiveUssdResponse(
+                telephonyManager: TelephonyManager,
+                request: String,
+                response: CharSequence
+            ) {
+                onResult("USSD result (SIM ${simSlotIndex + 1}): ${response.toString()}")
+            }
+
+            override fun onReceiveUssdResponseFailed(
+                telephonyManager: TelephonyManager,
+                request: String,
+                failureCode: Int
+            ) {
+                onResult("USSD failed on SIM ${simSlotIndex + 1}. Error code: $failureCode")
+            }
+        }
+
+        telephonyManager
+            .createForSubscriptionId(simInfo.subscriptionId)
+            .sendUssdRequest(ussdCode, ussdCallback, Handler(Looper.getMainLooper()))
+    } catch (e: SecurityException) {
+        onResult("Permission error: ${e.message}")
+    } catch (e: Exception) {
+        onResult("Error: ${e.message}")
+    }
+}
+
+fun Context.callUssdOnSim1(ussdCode: String, onResult: (String) -> Unit) {
+    callUssdOnSimSlot(ussdCode = ussdCode, simSlotIndex = 0, onResult = onResult)
+}
+
+fun Context.callUssdOnSim2(ussdCode: String, onResult: (String) -> Unit) {
+    callUssdOnSimSlot(ussdCode = ussdCode, simSlotIndex = 1, onResult = onResult)
+}
 

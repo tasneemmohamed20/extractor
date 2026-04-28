@@ -6,11 +6,13 @@ import android.os.Build
 import android.os.Environment
 import android.os.StatFs
 import android.bluetooth.BluetoothManager
+import android.media.MediaDrm
 import android.provider.Settings
 import android.telephony.TelephonyManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.telephony.SubscriptionManager
+import java.util.UUID
 
 data class SimCardInfo(
     val slotIndex: Int,          // Slot index (0, 1, etc.)
@@ -68,6 +70,7 @@ data class HardwareInfo(
     val cpuCores: Int,
     val kernelArch: String,
     val androidId: String,
+    val mediaDrmId: String,
     val imei: String,
     val bluetoothAddress: String,
     // SIM / network related
@@ -116,6 +119,7 @@ fun fetchHardwareInfo(context: Context): HardwareInfo {
     }
 
     val androidId = Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID) ?: "N/A"
+    val mediaDrmId = getWidevineDeviceId()
 
     val bluetoothAddress = try {
         val adapter = (context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
@@ -207,12 +211,16 @@ fun fetchHardwareInfo(context: Context): HardwareInfo {
             val activeSubscriptionInfoList = subscriptionManager?.activeSubscriptionInfoList ?: emptyList()
             @Suppress("DEPRECATION")
             activeSubscriptionInfoList.mapIndexed { index, info ->
+                val carrierName = info.carrierName?.toString().orEmpty()
+                val displayName = info.displayName?.toString().orEmpty()
+                val resolvedOperatorName = carrierName.ifBlank { displayName.ifBlank { "N/A" } }
+                val resolvedDisplayName = displayName.ifBlank { carrierName.ifBlank { "Unknown Carrier" } }
                 SimCardInfo(
                     slotIndex = index,
-                    operatorName = info.displayName?.toString() ?: "N/A",
+                    operatorName = resolvedOperatorName,
                     operatorCode = info.mcc.toString() + info.mnc.toString(),
                     countryIso = info.countryIso?.uppercase() ?: "N/A",
-                    displayName = info.displayName?.toString() ?: "Unknown Carrier",
+                    displayName = resolvedDisplayName,
                     subscriptionId = info.subscriptionId
                 )
             }
@@ -256,6 +264,7 @@ fun fetchHardwareInfo(context: Context): HardwareInfo {
         cpuCores = Runtime.getRuntime().availableProcessors(),
         kernelArch = System.getProperty("os.arch") ?: "N/A",
         androidId = androidId,
+        mediaDrmId = mediaDrmId,
         imei = imei,
         bluetoothAddress = bluetoothAddress,
         simOperator = simOperator,
@@ -276,6 +285,21 @@ private fun formatBytes(bytes: Long): String {
     return if (gb >= 1) "%.2f GB".format(gb)
     else "%.0f MB".format(bytes / (1024.0 * 1024.0))
 
+}
+
+private fun getWidevineDeviceId(): String {
+    return try {
+        val widevineUuid = UUID(-0x121074568629b532L, -0x5c37d8232ae2de13L)
+        val mediaDrm = MediaDrm(widevineUuid)
+        try {
+            val deviceId = mediaDrm.getPropertyByteArray(MediaDrm.PROPERTY_DEVICE_UNIQUE_ID)
+            deviceId.joinToString(separator = "") { byte -> "%02X".format(byte) }.ifEmpty { "N/A" }
+        } finally {
+            mediaDrm.release()
+        }
+    } catch (_: Exception) {
+        "N/A"
+    }
 }
 
 
